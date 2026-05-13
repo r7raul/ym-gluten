@@ -129,7 +129,7 @@ jobs:
         if: ${{ !steps.m2cache.outputs.cache-hit }}
         uses: actions/checkout@v4
         with:
-          repository: r7raul1984/packages
+          repository: r7raul/packages
           ref: master
           token: ${{ secrets.EBAY_TOKEN }}
       - name: Install packages
@@ -144,7 +144,7 @@ jobs:
         if: ${{ !steps.m2cache.outputs.cache-hit }}
         uses: actions/checkout@v4
         with:
-          repository: r7raul1984/ebay-spark
+          repository: r7raul/ebay-spark
           ref: gluten-build
           token: ${{ secrets.EBAY_TOKEN }}
       - name: Install ebay-spark
