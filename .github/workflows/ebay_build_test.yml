@@ -129,7 +129,7 @@ jobs:
         if: ${{ !steps.m2cache.outputs.cache-hit }}
         uses: actions/checkout@v4
         with:
-          repository: yuming/packages
+          repository: wangyum/packages
           ref: master
           token: ${{ secrets.EBAY_TOKEN }}
       - name: Install packages
@@ -144,7 +144,7 @@ jobs:
         if: ${{ !steps.m2cache.outputs.cache-hit }}
         uses: actions/checkout@v4
         with:
-          repository: yuming/ebay-spark
+          repository: wangyum/ebay-spark
           ref: gluten-build
           token: ${{ secrets.EBAY_TOKEN }}
       - name: Install ebay-spark
