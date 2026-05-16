@@ -1,8 +1,16 @@
 diff --git a/CMake/resolve_dependency_modules/arrow/CMakeLists.txt b/CMake/resolve_dependency_modules/arrow/CMakeLists.txt
-index 4f4e40319..046222487 100644
+index 4f4e40319..ea907cf94 100644
 --- a/CMake/resolve_dependency_modules/arrow/CMakeLists.txt
 +++ b/CMake/resolve_dependency_modules/arrow/CMakeLists.txt
-@@ -94,8 +94,8 @@ if(VELOX_ENABLE_ARROW)
+@@ -37,6 +37,7 @@ if(VELOX_ENABLE_ARROW)
+   set(
+     ARROW_CMAKE_ARGS
+     -DARROW_PARQUET=OFF
++    -DARROW_FILESYSTEM=ON
+     -DARROW_DEPENDENCY_SOURCE=AUTO
+     -DARROW_WITH_THRIFT=ON
+     -DARROW_WITH_LZ4=ON
+@@ -94,8 +95,8 @@ if(VELOX_ENABLE_ARROW)
      CMAKE_ARGS ${ARROW_CMAKE_ARGS}
      BUILD_BYPRODUCTS ${ARROW_LIBDIR}/libarrow.a ${ARROW_LIBDIR}/libarrow_testing.a ${THRIFT_LIB}
      PATCH_COMMAND
@@ -11,5 +19,5 @@ index 4f4e40319..046222487 100644
 +      git apply ${CMAKE_CURRENT_LIST_DIR}/thrift-download.patch &&
 +      python3 ${CMAKE_CURRENT_LIST_DIR}/fix-ep-policy.py
    )
- 
+
    add_library(arrow STATIC IMPORTED GLOBAL)

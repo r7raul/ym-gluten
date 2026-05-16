@@ -176,7 +176,7 @@ if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9.0)
 endif()
 
 find_arrow_lib(${ARROW_LIB_NAME})
-find_arrow_lib(${ARROW_BUNDLED_DEPS})
+find_arrow_lib(${ARROW_BUNDLED_DEPS} OPTIONAL)
 
 if(ENABLE_QAT)
   include(BuildQATzip)
@@ -228,8 +228,11 @@ else()
   set(LIBHDFS3_DESTINATION ${CMAKE_INSTALL_LIBDIR})
 endif()
 
-target_link_libraries(gluten PUBLIC Arrow::arrow
-                                    Arrow::arrow_bundled_dependencies)
+if(TARGET Arrow::arrow_bundled_dependencies)
+  target_link_libraries(gluten PUBLIC Arrow::arrow Arrow::arrow_bundled_dependencies)
+else()
+  target_link_libraries(gluten PUBLIC Arrow::arrow)
+endif()
 target_link_libraries(gluten PRIVATE google::glog)
 
 install(TARGETS gluten DESTINATION ${CMAKE_INSTALL_LIBDIR})
