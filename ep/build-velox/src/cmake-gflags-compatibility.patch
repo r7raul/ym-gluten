@@ -1,0 +1,13 @@
+diff --git a/CMake/resolve_dependency_modules/gflags.cmake b/CMake/resolve_dependency_modules/gflags.cmake
+index f937a7f70..32abc81c4 100644
+--- a/CMake/resolve_dependency_modules/gflags.cmake
++++ b/CMake/resolve_dependency_modules/gflags.cmake
+@@ -55,6 +55,8 @@ if(DEFINED CACHE{BUILD_SHARED_LIBS})
+   unset(BUILD_SHARED_LIBS CACHE)
+ endif()
+ 
++set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
++
+ FetchContent_MakeAvailable(gflags)
+ 
+ # Workaround for https://github.com/gflags/gflags/issues/277

@@ -102,11 +102,12 @@ function compile {
   # maintain compatibility, but it prints a diagnostic note about the unknown flag if a true warning
   # or error occurs.
   CXX_FLAGS='-Wno-error=stringop-overflow -Wno-error=cpp -Wno-missing-field-initializers \
-    -Wno-error=uninitialized -Wno-unknown-warning-option -Wno-deprecated-declarations'
+    -Wno-error=uninitialized -Wno-unknown-warning-option -Wno-deprecated-declarations \
+    -Wno-deprecated-literal-operator'
 
   COMPILE_OPTION="-DCMAKE_CXX_FLAGS=\"$CXX_FLAGS\" -DVELOX_ENABLE_PARQUET=ON -DVELOX_BUILD_TESTING=OFF \
       -DVELOX_MONO_LIBRARY=ON -DVELOX_BUILD_RUNNER=OFF -DVELOX_SIMDJSON_SKIPUTF8VALIDATION=ON \
-      -DVELOX_ENABLE_GEO=ON"
+      -DVELOX_ENABLE_GEO=ON -DBoost_SOURCE=BUNDLED -Dgflags_SOURCE=BUNDLED -Dglog_SOURCE=BUNDLED"
   if [ $BUILD_TEST_UTILS == "ON" ]; then
     COMPILE_OPTION="$COMPILE_OPTION -DVELOX_BUILD_TEST_UTILS=ON"
   fi

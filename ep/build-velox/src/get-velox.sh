@@ -143,9 +143,19 @@ function apply_provided_velox_patch {
 function apply_compilation_fixes {
   sudo cp ${CURRENT_DIR}/modify_arrow.patch ${VELOX_HOME}/CMake/resolve_dependency_modules/arrow/
   sudo cp ${CURRENT_DIR}/modify_arrow_dataset_scan_option.patch ${VELOX_HOME}/CMake/resolve_dependency_modules/arrow/
+  sudo cp ${CURRENT_DIR}/fix-ep-policy.py ${VELOX_HOME}/CMake/resolve_dependency_modules/arrow/
 
   git add ${VELOX_HOME}/CMake/resolve_dependency_modules/arrow/modify_arrow.patch # to avoid the file from being deleted by git clean -dffx :/
   git add ${VELOX_HOME}/CMake/resolve_dependency_modules/arrow/modify_arrow_dataset_scan_option.patch # to avoid the file from being deleted by git clean -dffx :/
+  git add ${VELOX_HOME}/CMake/resolve_dependency_modules/arrow/fix-ep-policy.py # to avoid the file from being deleted by git clean -dffx :/
+
+  # Fix gflags/xsimd build with CMake >= 3.30 which removed support for cmake_minimum_required < 3.5
+  # Arrow 18.0.0 already contains the cmake-compatibility.patch fixes, so drop it from PATCH_COMMAND
+  cd ${VELOX_HOME}
+  git apply ${CURRENT_DIR}/cmake-gflags-compatibility.patch || true
+  git apply ${CURRENT_DIR}/cmake-glog-compatibility.patch || true
+  git apply ${CURRENT_DIR}/cmake-xsimd-compatibility.patch || true
+  git apply ${CURRENT_DIR}/cmake-arrow-patch-cmd.patch || true
 }
 
 function setup_linux {

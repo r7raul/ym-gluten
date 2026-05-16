@@ -1,0 +1,13 @@
+diff --git a/CMake/resolve_dependency_modules/glog.cmake b/CMake/resolve_dependency_modules/glog.cmake
+index 28256bfa0..3654712fe 100644
+--- a/CMake/resolve_dependency_modules/glog.cmake
++++ b/CMake/resolve_dependency_modules/glog.cmake
+@@ -42,6 +42,8 @@ set(BUILD_SHARED_LIBS ${VELOX_BUILD_SHARED})
+ set(WITH_UNWIND OFF)
+ set(gflags_NAMESPACE google)
+ set(BUILD_TESTING OFF)
++set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
++
+ FetchContent_MakeAvailable(glog)
+ unset(BUILD_TESTING)
+ unset(BUILD_SHARED_LIBS)

@@ -1,0 +1,11 @@
+diff --git a/CMake/resolve_dependency_modules/xsimd.cmake b/CMake/resolve_dependency_modules/xsimd.cmake
+index 7cbd4258a..9eddcf50f 100644
+--- a/CMake/resolve_dependency_modules/xsimd.cmake
++++ b/CMake/resolve_dependency_modules/xsimd.cmake
+@@ -32,4 +32,6 @@ FetchContent_Declare(
+   URL_HASH ${VELOX_XSIMD_BUILD_SHA256_CHECKSUM}
+ )
+ 
++set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
++
+ FetchContent_MakeAvailable(xsimd)
