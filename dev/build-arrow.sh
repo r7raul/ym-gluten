@@ -49,7 +49,7 @@ function build_arrow_cpp() {
     fi
   fi
   cmake_install \
-       -DARROW_PARQUET=OFF \
+       -DARROW_PARQUET=ON \
        -DARROW_FILESYSTEM=ON \
        -DARROW_PROTOBUF_USE_SHARED=OFF \
        -DARROW_DEPENDENCY_USE_SHARED=OFF \
@@ -78,8 +78,8 @@ function build_arrow_cpp() {
 function build_arrow_java() {
     ARROW_INSTALL_DIR="${ARROW_PREFIX}/install"
 
-    # Use Gluten's Maven wrapper
-    MVN_CMD="${CURRENT_DIR}/../build/mvn"
+    # Use Gluten's Maven wrapper, forcing eBay repos and raptor2 local repo
+    MVN_CMD="${CURRENT_DIR}/../build/mvn -Dmaven.repo.local=${HOME}/.m2/raptor2 -P ebay"
 
     # set default number of threads as cpu cores minus 2
     if [[ "$(uname)" == "Darwin" ]]; then

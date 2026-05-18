@@ -26,6 +26,10 @@
   <packaging>jar</packaging>
   <name>Gluten Shims Common</name>
 
+  <properties>
+    <scalafmt.conf.path>${project.basedir}/../../.scalafmt.conf</scalafmt.conf.path>
+  </properties>
+
   <dependencies>
     <dependency>
       <groupId>org.apache.spark</groupId>

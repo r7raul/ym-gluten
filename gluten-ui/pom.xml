@@ -26,6 +26,10 @@
   <artifactId>gluten-ui</artifactId>
   <name>Gluten UI</name>
 
+  <properties>
+    <scalafmt.conf.path>${project.basedir}/../.scalafmt.conf</scalafmt.conf.path>
+  </properties>
+
   <dependencies>
     <dependency>
       <groupId>org.apache.gluten</groupId>

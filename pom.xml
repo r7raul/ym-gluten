@@ -65,6 +65,7 @@
   </distributionManagement>
 
   <properties>
+    <scalafmt.conf.path>${project.basedir}/.scalafmt.conf</scalafmt.conf.path>
     <java.version>1.8</java.version>
     <maven.compiler.source>${java.version}</maven.compiler.source>
     <maven.compiler.target>${java.version}</maven.compiler.target>
@@ -785,7 +786,7 @@
               <scalafmt>
                 <version>${spotless.scalafmt.version}</version>
                 <scalaMajorVersion>${scala.binary.version}</scalaMajorVersion>
-                <file>.scalafmt.conf</file>
+                <file>${scalafmt.conf.path}</file>
               </scalafmt>
               <licenseHeader>
                 <content>${spotless.license.header}</content>

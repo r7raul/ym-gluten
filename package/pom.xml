@@ -26,6 +26,10 @@
   <packaging>jar</packaging>
   <name>Gluten Package</name>
 
+  <properties>
+    <scalafmt.conf.path>${project.basedir}/../.scalafmt.conf</scalafmt.conf.path>
+  </properties>
+
   <dependencies>
     <!-- Do not remove the following. They are for enforcer plugin -->
     <dependency>

@@ -30,6 +30,10 @@
     <module>common</module>
   </modules>
 
+  <properties>
+    <scalafmt.conf.path>${project.basedir}/../.scalafmt.conf</scalafmt.conf.path>
+  </properties>
+
   <dependencies>
     <dependency>
       <groupId>org.scalatest</groupId>

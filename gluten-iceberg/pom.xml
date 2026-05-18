@@ -28,6 +28,10 @@
   <packaging>jar</packaging>
   <name>Gluten Iceberg</name>
 
+  <properties>
+    <scalafmt.conf.path>${project.basedir}/../.scalafmt.conf</scalafmt.conf.path>
+  </properties>
+
   <dependencies>
     <dependency>
       <groupId>org.apache.gluten</groupId>
@@ -116,10 +120,17 @@
       <plugin>
         <groupId>org.scalastyle</groupId>
         <artifactId>scalastyle-maven-plugin</artifactId>
+        <configuration>
+          <configLocation>${project.basedir}/../dev/scalastyle-config.xml</configLocation>
+        </configuration>
       </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-checkstyle-plugin</artifactId>
+        <configuration>
+          <configLocation>${project.basedir}/../dev/checkstyle.xml</configLocation>
+          <suppressionsLocation>${project.basedir}/../dev/checkstyle-suppressions.xml</suppressionsLocation>
+        </configuration>
       </plugin>
       <plugin>
         <groupId>com.diffplug.spotless</groupId>
