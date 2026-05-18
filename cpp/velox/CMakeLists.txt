@@ -318,6 +318,15 @@ endif()
 
 target_link_libraries(velox PUBLIC facebook::velox)
 
+# Velox was compiled against /usr/local/include/arrow (our build-arrow.sh install)
+# which has const-ref API. Link that Arrow library to satisfy those references.
+if(EXISTS /usr/local/lib/libarrow.a)
+  target_link_libraries(velox PUBLIC /usr/local/lib/libarrow.a)
+endif()
+if(EXISTS /usr/local/lib/libarrow_bundled_dependencies.a)
+  target_link_libraries(velox PUBLIC /usr/local/lib/libarrow_bundled_dependencies.a)
+endif()
+
 target_link_libraries(velox PUBLIC Folly::folly)
 
 find_re2()

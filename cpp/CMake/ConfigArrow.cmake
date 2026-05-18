@@ -51,7 +51,7 @@ function(FIND_ARROW_LIB LIB_NAME)
     endif()
     message(STATUS "Found Arrow library: ${ARROW_LIB_${LIB_NAME}}")
 
-    add_library(Arrow::${LIB_NAME} STATIC IMPORTED)
+    add_library(Arrow::${LIB_NAME} STATIC IMPORTED GLOBAL)
     # Get the parent-parent directory of the lib file. For example:
     #
     # * ${ARROW_LIB_${LIB_NAME}}: /usr/local/lib/libarrow.a
