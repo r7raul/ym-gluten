@@ -435,6 +435,136 @@ content=1 files=3:
   del-00003  ← marks liam (ACTIVE: 00003 is unchanged)
 ```
 
+### Code walkthrough: how write.update.mode is read and dispatched
+
+The mode selection happens in `SparkRowLevelOperationBuilder.java` (Iceberg Spark integration):
+
+```java
+// SparkRowLevelOperationBuilder.java — build()
+switch (mode) {
+  case COPY_ON_WRITE:
+    return new SparkCopyOnWriteOperation(...);   // CoW path
+  case MERGE_ON_READ:
+    return new SparkPositionDeltaOperation(...); // MoR path → WriteDeltaExec
+}
+
+// mode() reads the table property for each DML command:
+case UPDATE:
+  modeName = properties.getOrDefault(UPDATE_MODE, UPDATE_MODE_DEFAULT);
+```
+
+`SparkPositionDeltaOperation` (the MoR path) declares:
+```java
+// rowId() — tells Spark which metadata columns identify a row's position
+public NamedReference[] rowId() {
+  return new NamedReference[] {
+    Expressions.column(MetadataColumns.FILE_PATH.name()),   // _file
+    Expressions.column(MetadataColumns.ROW_POSITION.name()) // _pos
+  };
+}
+
+// UPDATE is represented as DELETE (old pos) + INSERT (new values)
+public boolean representUpdateAsDeleteAndInsert() { return true; }
+```
+
+In Spark's physical planner (`DataSourceV2Strategy`), this maps to `WriteDeltaExec` — a `V2ExistingTableWriteExec` that handles position-delta writes via `DeltaWrite`. Critically, Gluten's `OffloadIcebergWrite` only offloads `ReplaceDataExec`, `AppendDataExec`, `OverwriteByExpressionExec`, and `OverwritePartitionsDynamicExec` — **`WriteDeltaExec` is not in the offload list**.
+
+**Verified physical plan for MoR UPDATE (EXPLAIN output, 2026-05-20):**
+
+```
+WriteDelta org.apache.iceberg.spark.source.SparkPositionDeltaWrite@...   ← vanilla Spark
++- VeloxColumnarToRow
+   +- ColumnarExchange hashpartitioning(_spec_id, _partition, _file, 500), REBALANCE_PARTITIONS_BY_COL
+      +- VeloxResizeBatches
+         +- ^(1) ProjectExecTransformer [... (score + 10.0) AS _pre_2]     ← Velox native
+            +- ^(1) ExpandExecTransformer                                  ← Velox native
+               [[1, null,null,null,null, _file,_pos,_spec_id,_partition],  ← op=1: DELETE row
+                [3, id,name,_pre_2,region, null,null,null,null]]           ← op=3: INSERT row
+               +- ^(1) FilterExecTransformer (region=APAC AND score<70)    ← Velox native
+                  +- ^(1) InputIteratorTransformer
+                     +- RowToVeloxColumnar                                 ← format round-trip
+                        +- *(1) ColumnarToRow
+                           +- BatchScan [_file, _pos, _spec_id, _partition, ...]  ← NOT IcebergScanTransformer!
+```
+
+**Verified physical plan for MoR DELETE (EXPLAIN output, 2026-05-20):**
+
+```
+WriteDelta org.apache.iceberg.spark.source.SparkPositionDeltaWrite@...   ← vanilla Spark
++- VeloxColumnarToRow
+   +- ColumnarExchange hashpartitioning(_spec_id, _partition, _file, 500), REBALANCE_PARTITIONS_BY_COL
+      +- VeloxResizeBatches
+         +- ^(1) ProjectExecTransformer [hash(...) AS hash_partition_key,
+                                         1 AS __row_operation,            ← op=1 hardcoded (DELETE only)
+                                         _file, _pos, _spec_id, _partition]
+            +- ^(1) FilterExecTransformer id IN (2, 8, 12)               ← Velox native
+               +- ^(1) InputIteratorTransformer
+                  +- RowToVeloxColumnar                                   ← format round-trip
+                     +- *(1) ColumnarToRow
+                        +- BatchScan [id, _file, _pos, _spec_id, _partition]  ← NOT IcebergScanTransformer!
+```
+
+DELETE vs UPDATE plan differences:
+- No `ExpandExecTransformer` — DELETE generates only `op=1` (DELETE) rows; no INSERT phase
+- `ProjectExecTransformer` hardcodes `1 AS __row_operation` (no new values to compute)
+- Only data column `id` is read (needed for the filter); no value columns needed
+
+**Key findings from the actual plans (DELETE and UPDATE):**
+
+**1. Scan falls back to `BatchScan` (not `IcebergScanTransformer`) for both DELETE and UPDATE**
+
+Both MoR DELETE and UPDATE must read `_file`, `_pos`, `_spec_id`, `_partition` metadata columns to identify which physical rows to delete. `IcebergScanTransformer` does not support these virtual metadata columns, so Gluten cannot offload the scan for either operation. Vanilla Spark `BatchScan` is used instead.
+
+**2. Inefficient format round-trip at the scan boundary**
+
+```
+BatchScan (columnar output)
+  → ColumnarToRow     (columnar → row, for Spark vanilla compatibility)
+  → RowToVeloxColumnar (row → Velox columnar, to feed Gluten operators)
+```
+
+Two conversions that cancel each other out — a known limitation when Gluten cannot replace the scan.
+
+**3. `ExpandExecTransformer` runs in Velox**
+
+Each row matching the WHERE clause is expanded into two rows by Gluten natively:
+- `op=1` (DELETE): carries `_file`, `_pos` (position to delete) — data columns set to null
+- `op=3` (INSERT): carries new column values — position columns set to null
+
+**4. `WriteDelta` is vanilla Spark — not offloaded by Gluten**
+
+`WriteDeltaExec` extends `V2ExistingTableWriteExec`, a completely different class from `WriteToDataSourceV2Exec`. Gluten's `OffloadIcebergWrite` only handles `ReplaceDataExec`, `AppendDataExec`, `OverwriteByExpressionExec`, and `OverwritePartitionsDynamicExec`. `WriteDeltaExec` is absent from the offload list, so the write runs row-by-row in vanilla Spark via `SparkPositionDeltaWrite` → Iceberg RowDelta commit.
+
+**Gluten offload coverage for MoR UPDATE:**
+
+| Plan node | Offloaded to Velox? | Reason |
+|---|---|---|
+| `BatchScan` | ❌ vanilla Spark | Needs `_file`, `_pos` metadata columns — `IcebergScanTransformer` does not support them |
+| `FilterExecTransformer` | ✅ Velox | Standard columnar filter |
+| `ProjectExecTransformer` (score+10) | ✅ Velox | Standard columnar project |
+| `ExpandExecTransformer` | ✅ Velox | Gluten native expand for DELETE/INSERT rows |
+| `ColumnarExchange` | ✅ Gluten | Columnar shuffle |
+| `WriteDelta` | ❌ vanilla Spark | `WriteDeltaExec` not in Gluten offload list |
+
+**Contrast with fully-offloaded operations:**
+
+| Operation | Scan | Write | Gluten coverage |
+|---|---|---|---|
+| SELECT | `IcebergScanTransformer` ✅ | — | Full |
+| INSERT | `IcebergScanTransformer` ✅ | `VeloxIcebergAppendDataExec` ✅ | Full |
+| rewrite_data_files | `IcebergScanTransformer` ✅ | `VeloxIcebergReplaceDataExec` ✅ | Full |
+| MoR DELETE | `BatchScan` ❌ | `WriteDeltaExec` ❌ | Filter only |
+| MoR UPDATE | `BatchScan` ❌ | `WriteDeltaExec` ❌ | Filter/project/expand only |
+
+**Summary of DML → write mode → physical exec → Gluten coverage:**
+
+| DML | write mode | Iceberg operation | Spark exec | Gluten handles? | File effect |
+|---|---|---|---|---|---|
+| DELETE | MoR | `SparkPositionDeltaOperation` | `WriteDeltaExec` | ❌ scan yes, write no | position delete file added |
+| UPDATE | MoR | `SparkPositionDeltaOperation` | `WriteDeltaExec` | ❌ scan no, write no | file split + new data file |
+| MERGE | MoR | `SparkPositionDeltaOperation` | `WriteDeltaExec` | partial | mixed |
+| rewrite_data_files | — | `SparkWrite.CopyOnWriteOperation` | `ReplaceDataExec` | ✅ full | files compacted, deletes materialised |
+
 ### Why `rewrite_data_files` eliminates delete files
 
 `rewrite_data_files` is effectively a manual CoW pass over MoR data:
@@ -607,6 +737,125 @@ total-delete-files = 0        ← no delete file needed
 **How to see position delete files:** Set `spark.sql.shuffle.partitions=1` so each INSERT batch produces a single multi-row file. Deleting a subset of rows from that file forces Iceberg to write a position delete file (`content=1`).
 
 ---
+
+### Finding 4 — Why SELECT / INSERT / rewrite_data_files are fully Gluten-offloaded but DELETE / UPDATE are not
+
+The difference comes down to whether the scan needs **virtual position metadata columns**.
+
+**SELECT, INSERT source scan, rewrite_data_files — data columns only:**
+
+```
+SELECT * FROM t WHERE score > 80
+  → read schema: id, name, score, region  (plain data columns)
+  → IcebergScanTransformer validates OK ✅ → full Velox pipeline
+
+rewrite_data_files
+  → read schema: data columns only (MoR merge applied internally by Velox)
+  → IcebergScanTransformer validates OK ✅ → full Velox pipeline
+```
+
+**MoR DELETE / UPDATE — must expose physical row position:**
+
+```
+DELETE FROM t WHERE id = 5
+  → must produce a position delete file containing (file_path, row_pos) for id=5
+  → read schema must include: _file, _pos, _spec_id, _partition
+  → IcebergScanTransformer.doValidateInternal() detects these and returns:
+       ValidationResult.failed("Read unsupported metadata column")
+  → Gluten falls back to vanilla BatchScan ❌
+```
+
+**The exact validation code** (`IcebergScanTransformer.scala` line 103):
+
+```scala
+val allowedMetadataColumns =
+  Set("input_file_name", "input_file_block_start", "input_file_block_length")
+
+val hasUnsupportedMetadata = scan.readSchema().fieldNames.exists { f =>
+  MetadataColumns.isMetadataColumn(f) &&
+  !allowedMetadataColumns.contains(f.toLowerCase(Locale.ROOT))
+}
+if (hasUnsupportedMetadata) {
+  return ValidationResult.failed("Read unsupported metadata column")  // ← triggers BatchScan fallback
+}
+```
+
+Only three metadata column names are whitelisted. `_file`, `_pos`, `_spec_id`, and `_partition` are all absent from the whitelist.
+
+**Why these columns cannot be trivially added to IcebergScanTransformer:**
+
+Velox's `IcebergSplitReader` generates `_file` (current file path) and `_pos` (sequential row counter) internally while reading, and uses them to apply position delete files. However, it does **not** expose them as output columns in the Arrow `ColumnarBatch` returned to Spark. Supporting DELETE and UPDATE natively in Velox would require:
+
+1. **Velox C++ layer**: expose `_file` and `_pos` as extra output columns in `IcebergSplitReader`'s returned `RowVector`
+2. **Gluten JNI layer**: map those extra columns through the JNI boundary into Arrow format
+3. **Gluten Scala layer**: add `_file`/`_pos` to `IcebergScanTransformer`'s output and whitelist
+4. **New write executor**: implement `VeloxIcebergWriteDeltaExec` to offload `WriteDeltaExec` (position delete + data file write via Iceberg RowDelta) — currently no Velox equivalent exists
+
+This is a **complete feature gap**, not a small patch. Until it is implemented, MoR DELETE and UPDATE will continue to use `BatchScan` (vanilla scan) and `WriteDeltaExec` (vanilla write), with only the intermediate operators (filter, project, expand) benefiting from Velox.
+
+**Summary:**
+
+| Operation | Needs `_file`/`_pos`? | Scan | Write | Fully Velox? |
+|---|---|---|---|---|
+| SELECT | No | `IcebergScanTransformer` ✅ | — | ✅ Yes |
+| INSERT | No | `LocalTableScanExec` (VALUES) | `VeloxIcebergAppendDataExec` ✅ | ✅ Yes |
+| rewrite_data_files | No (MoR applied internally) | `IcebergScanTransformer` ✅ | `VeloxIcebergReplaceDataExec` ✅ | ✅ Yes |
+| MoR DELETE | Yes → validation fails | `BatchScan` ❌ | `WriteDeltaExec` ❌ | ❌ Partial |
+| MoR UPDATE | Yes → validation fails | `BatchScan` ❌ | `WriteDeltaExec` ❌ | ❌ Partial |
+
+### Finding 3 — MoR DELETE and UPDATE are only partially Gluten-offloaded
+
+**Symptom:** `EXPLAIN DELETE` and `EXPLAIN UPDATE` on a MoR table show `BatchScan` (not `IcebergScanTransformer`) at the scan layer and `WriteDelta` (not any Velox exec) at the write layer. Neither operation achieves full Gluten offload.
+
+**Root cause — metadata columns required by position delta:**
+
+MoR DELETE and UPDATE must identify the physical location of each affected row to write position delete files. Iceberg achieves this by injecting virtual metadata columns into the scan:
+
+```
+_file      — which Parquet file contains this row
+_pos       — row's physical index within that file
+_spec_id   — partition spec ID
+_partition — partition values
+```
+
+`IcebergScanTransformer` (Gluten's native Iceberg scan) does not support these metadata columns — it only handles regular data columns. When the planner detects that `_file` or `_pos` are needed, it falls back to vanilla Spark `BatchScan`.
+
+Additionally, `WriteDeltaExec` (which writes position delete files via Iceberg's `SparkPositionDeltaWrite.RowDelta`) is not in Gluten's `OffloadIcebergWrite` list — the offload rules only cover `ReplaceDataExec`, `AppendDataExec`, `OverwriteByExpressionExec`, and `OverwritePartitionsDynamicExec`.
+
+**Actual plan structure (confirmed with EXPLAIN, 2026-05-20):**
+
+```
+DELETE plan:
+  WriteDelta (SparkPositionDeltaWrite)          ← vanilla Spark write
+    VeloxColumnarToRow
+      ColumnarExchange (REBALANCE by _file)     ← Gluten columnar shuffle
+        ^(1) ProjectExecTransformer             ← Velox: hardcode op=1, pass _file/_pos
+          ^(1) FilterExecTransformer            ← Velox: id IN (2,8,12)
+            RowToVeloxColumnar ← ColumnarToRow  ← format round-trip (inefficiency)
+              BatchScan [id, _file, _pos, ...]  ← vanilla Spark scan
+
+UPDATE plan:
+  WriteDelta (SparkPositionDeltaWrite)          ← vanilla Spark write
+    VeloxColumnarToRow
+      ColumnarExchange (REBALANCE by _file)     ← Gluten columnar shuffle
+        ^(1) ExpandExecTransformer              ← Velox: expand row → DELETE+INSERT pair
+          ^(1) ProjectExecTransformer           ← Velox: compute new values (score+10)
+            ^(1) FilterExecTransformer          ← Velox: region=APAC AND score<70
+              RowToVeloxColumnar ← ColumnarToRow ← format round-trip
+                BatchScan [data cols, _file, _pos, ...] ← vanilla Spark scan
+```
+
+**Gluten coverage comparison:**
+
+| Operator layer | DELETE | UPDATE | SELECT / INSERT / rewrite |
+|---|---|---|---|
+| Scan | ❌ `BatchScan` | ❌ `BatchScan` | ✅ `IcebergScanTransformer` |
+| Filter / Project | ✅ Velox | ✅ Velox | ✅ Velox |
+| Expand (DELETE+INSERT) | n/a | ✅ Velox | n/a |
+| Shuffle | ✅ `ColumnarExchange` | ✅ `ColumnarExchange` | ✅ `ColumnarExchange` |
+| Write | ❌ `WriteDeltaExec` | ❌ `WriteDeltaExec` | ✅ Velox exec |
+
+**Impact:** MoR DELETE and UPDATE incur vanilla Spark overhead at both ends of the pipeline. The intermediate compute (filter, project, expand) benefits from Velox, but the format round-trip (`BatchScan` → `ColumnarToRow` → `RowToVeloxColumnar`) adds unnecessary conversion cost. For write-heavy MoR workloads, `rewrite_data_files` (which is fully Gluten-accelerated) should be run frequently to limit the accumulation of delete files.
 
 ### Finding 2 — One file per row with default parallelism
 
