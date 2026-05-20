@@ -630,6 +630,77 @@ WHEN NOT MATCHED AND s.op = 'I' THEN INSERT (order_id, status, amount) VALUES (s
 
 This is the standard pattern for Flink/Spark real-time data warehouses: Iceberg as the storage layer, `MERGE INTO` as the SQL interface. The accumulated position delete files from repeated MERGE runs are the main driver for scheduling `rewrite_data_files` and `rewrite_position_delete_files` maintenance jobs.
 
+### Why MERGE requires a JOIN but UPDATE does not
+
+**UPDATE touches only one table — a filter is enough:**
+
+```sql
+UPDATE gluten_test SET score = score + 10
+WHERE region = 'APAC' AND score < 70
+-- Only one table. Scan target → apply WHERE filter → write.
+-- No second table, no JOIN.
+```
+
+**MERGE touches two tables — a JOIN is mandatory to determine which rows match:**
+
+```sql
+MERGE INTO gluten_test t       ← target table
+USING gluten_test_src s        ← source table (second table)
+ON t.id = s.id                 ← match condition
+WHEN MATCHED     THEN UPDATE ...
+WHEN NOT MATCHED THEN INSERT ...
+```
+
+The engine cannot know which target rows match which source rows without scanning both tables and joining them on `t.id = s.id`. The join result drives the three-way split:
+
+```
+Scan target (with _file, _pos)  +  Scan source (plain)
+           ↓
+     JOIN ON t.id = s.id
+           ↓
+  ┌────────────────────────────────┬─────────────────────────────────┐
+  │  MATCHED rows                  │  NOT MATCHED rows               │
+  │  t.id=1 (alice) ↔ s.id=1      │  s.id=16 (peter) — no target   │
+  │                                │  s.id=17 (quinn) — no target   │
+  └────────────────────────────────┴─────────────────────────────────┘
+           ↓                                    ↓
+  ExpandExecTransformer                  INSERT rows only (op=3)
+  DELETE row (op=1, old alice pos)
+  INSERT row (op=3, alice-updated)
+           ↓
+     WriteDelta (SparkPositionDeltaWrite)
+     op=1 → position delete file   op=3 → new data file
+```
+
+**Analogy:** UPDATE is self-checking — scan your own ledger and fix entries that match a condition. MERGE is cross-referencing — hold up a second ledger (source) against the first (target) row by row; update or delete what matches, insert what does not. The cross-referencing step is the JOIN.
+
+**File changes for the test-plan MERGE (verified 2026-05-20):**
+
+Source has 3 rows: `id=1` (matched → UPDATE alice), `id=16` and `id=17` (unmatched → INSERT).
+
+```
+MATCHED UPDATE (alice, id=1):
+  Data file containing alice is rewritten without alice → new file 00001'
+  New data file A: alice-updated(99.0), peter(85.0), quinn(78.0)
+
+NOT MATCHED INSERT (peter id=16, quinn id=17):
+  Written into the same new data file A above
+
+Delete files: delete file for alice's old data file becomes orphaned
+              (same pattern as MoR UPDATE — file rewrite eliminates the need
+               for a new position delete file)
+```
+
+**Gluten offload for MERGE vs UPDATE vs DELETE:**
+
+| Operation | Scan | JOIN | Write | Velox coverage |
+|---|---|---|---|---|
+| DELETE | `BatchScan` ❌ | none | `WriteDeltaExec` ❌ | Filter only |
+| UPDATE | `BatchScan` ❌ | none | `WriteDeltaExec` ❌ | Filter / project / expand |
+| MERGE | `BatchScan` ❌ | `ShuffledHashJoinExecTransformer` ✅ (if both sides columnar) | `WriteDeltaExec` ❌ | Join / filter / expand |
+
+The MERGE JOIN can run in Velox if both the target scan (`BatchScan`) and the source scan produce columnar output that Gluten can feed into `ShuffledHashJoinExecTransformer`. Verify with `EXPLAIN MERGE INTO ...`.
+
 ### Impact of schema changes on delete files
 
 The two delete file types behave very differently when the table schema evolves.
@@ -802,6 +873,43 @@ This is a **complete feature gap**, not a small patch. Until it is implemented, 
 | rewrite_data_files | No (MoR applied internally) | `IcebergScanTransformer` ✅ | `VeloxIcebergReplaceDataExec` ✅ | ✅ Yes |
 | MoR DELETE | Yes → validation fails | `BatchScan` ❌ | `WriteDeltaExec` ❌ | ❌ Partial |
 | MoR UPDATE | Yes → validation fails | `BatchScan` ❌ | `WriteDeltaExec` ❌ | ❌ Partial |
+| MERGE source | No | `IcebergScanTransformer` ✅ | — | ✅ Yes (source side) |
+| MERGE target | Yes → validation fails | `BatchScan` ❌ | `WriteDeltaExec` ❌ | ❌ Partial |
+
+### Finding 5 — Why MERGE source uses IcebergScanTransformer but UPDATE/DELETE cannot
+
+**MERGE has two tables; UPDATE/DELETE have only one.**
+
+In MERGE, the two responsibilities are split across two separate scan nodes:
+
+```
+Target scan — must expose physical row location (to write position delete entries):
+  read schema: [id, region, _file, _pos, _spec_id, _partition]
+  → _file and _pos present → doValidateInternal() fails → BatchScan ❌
+
+Source scan — only needs to supply new values and drive the ON join condition:
+  read schema: [id, name, score, region]   (plain data columns only)
+  → no metadata columns → doValidateInternal() passes → IcebergScanTransformer ✅
+```
+
+The position delete file entry is `(target._file, target._pos)` — coordinates that come entirely from the **target** scan. The source contributes only column values (for UPDATE new values and INSERT rows). Because the two roles are assigned to two separate scans, the source scan never needs metadata columns.
+
+**UPDATE/DELETE have a single table that must serve both roles simultaneously:**
+
+```
+DELETE FROM t WHERE id IN (2, 8, 12)
+  One scan, two requirements:
+    data columns:     id           ← needed for WHERE filter
+    metadata columns: _file, _pos  ← needed to write position delete file
+  Combined read schema: [id, _file, _pos, _spec_id, _partition]
+  → _file/_pos detected → validation fails → BatchScan ❌
+```
+
+There is no second table to offload the "physical location" responsibility to. A single scan cannot satisfy both roles with `IcebergScanTransformer` as it is today.
+
+**Analogy:** MERGE is two workers collaborating — one looks up addresses (target, needs metadata), the other fetches goods (source, needs values only). Gluten accelerates the worker who only fetches goods. UPDATE/DELETE is one worker who must both look up addresses and fetch goods at the same time — Gluten cannot accelerate that worker until `IcebergScanTransformer` supports exposing `_file`/`_pos` as output columns.
+
+**Verified with EXPLAIN (2026-05-20):** Even after setting `write.delete.mode=merge-on-read` on the source table and deleting a row (so the source has a position delete file), the MERGE plan still shows `IcebergScanTransformer` for the source scan. Having delete files on the source does **not** cause a fallback — Velox's `IcebergSplitReader` applies them transparently at the C++ layer without surfacing them to the Spark plan.
 
 ### Finding 3 — MoR DELETE and UPDATE are only partially Gluten-offloaded
 
