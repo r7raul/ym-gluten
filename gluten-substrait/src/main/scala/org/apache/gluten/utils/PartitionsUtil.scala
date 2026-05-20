@@ -17,13 +17,13 @@
 package org.apache.gluten.utils
 
 import org.apache.gluten.config.GlutenConfig
+import org.apache.gluten.execution.PartitionedFileUtilShim
 import org.apache.gluten.sql.shims.SparkShimLoader
 import org.apache.gluten.utils.PartitionsUtil.regeneratePartition
 
 import org.apache.spark.Partition
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.Attribute
-import org.apache.spark.sql.execution.PartitionedFileUtil
 import org.apache.spark.sql.execution.datasources.{BucketingUtils, FilePartition, HadoopFsRelation, PartitionDirectory, PartitionedFile}
 import org.apache.spark.sql.execution.datasources.FilePartition.{maxSplitBytesBySpecifiedNum, minPartitionNumBySpecifiedSize}
 import org.apache.spark.sql.types.StructType
@@ -108,10 +108,9 @@ case class PartitionsUtil(
               if (shouldProcess(filePath)) {
                 val isSplitable =
                   relation.fileFormat.isSplitable(relation.sparkSession, relation.options, filePath)
-                PartitionedFileUtil.splitFiles(
+                PartitionedFileUtilShim.splitFiles(
                   sparkSession = relation.sparkSession,
                   file = file,
-                  filePath = filePath,
                   isSplitable = isSplitable,
                   maxSplitBytes = maxSplitBytes,
                   partitionValues = partition.values
