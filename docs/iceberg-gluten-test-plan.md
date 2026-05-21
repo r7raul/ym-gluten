@@ -965,6 +965,226 @@ UPDATE plan:
 
 **Impact:** MoR DELETE and UPDATE incur vanilla Spark overhead at both ends of the pipeline. The intermediate compute (filter, project, expand) benefits from Velox, but the format round-trip (`BatchScan` → `ColumnarToRow` → `RowToVeloxColumnar`) adds unnecessary conversion cost. For write-heavy MoR workloads, `rewrite_data_files` (which is fully Gluten-accelerated) should be run frequently to limit the accumulation of delete files.
 
+### Finding 6 — Why orphaned delete files survive after UPDATE and why `rewrite_position_delete_files` returns 0
+
+**Observed symptom:**
+
+After DELETE (creates 3 position delete files) followed by UPDATE (rewrites 2 data files), the file layout is:
+
+```
+content=0 files=5:  00001', 00002', 00003, A  (UPDATE rewrote 00001 and 00002)
+content=1 files=3:  del-00001, del-00002, del-00003
+```
+
+Running `rewrite_position_delete_files` returns `0  0  0  0` — yet 3 delete files remain.
+
+**Root cause — part 1: why del-00001 and del-00002 are orphaned**
+
+UPDATE uses `RewriteFiles` (via `VeloxIcebergReplaceDataExec` / `ReplaceDataExec`) — an atomic file replacement commit:
+
+```
+RewriteFiles commit:
+  removed from snapshot manifest: 00001.parquet, 00002.parquet
+  added   to snapshot manifest:   00001'.parquet, 00002'.parquet, A.parquet
+
+Result:
+  del-00001 → still in manifest, but its referenced 00001.parquet is gone  ← orphan
+  del-00002 → still in manifest, but its referenced 00002.parquet is gone  ← orphan
+  del-00003 → still valid (00003.parquet is still in the snapshot)         ← active
+```
+
+Iceberg's `RewriteFiles` commit only declares which data files are being replaced. The manifest merge logic does **not** automatically remove delete files whose referenced data files were just removed — that cleanup is deliberately delegated to `expire_snapshots`.
+
+**Root cause — part 2: why `rewrite_position_delete_files` returns 0**
+
+The procedure skips files that are not eligible for compaction:
+
+1. **Orphaned delete files** (`del-00001`, `del-00002`) — their referenced data files are no longer in the current snapshot; the procedure skips them
+2. **Single active delete file** (`del-00003`) — the default `min-input-files=2` requires at least two delete files targeting related data before compaction is attempted; one file alone cannot be compacted
+3. Result: zero eligible files → `0  0  0  0`
+
+`rewrite_position_delete_files` is designed for the case where many small delete files have accumulated for the **same** data file (e.g. high-frequency Flink CDC). It is not a cleanup tool for orphaned or single delete files.
+
+**Correct cleanup sequence:**
+
+```sql
+-- Step 1: materialise the active delete (del-00003 → bake liam's deletion into new data file)
+CALL local.system.rewrite_data_files(
+  table   => 'local.db.gluten_test',
+  options => map('min-input-files', '2')
+);
+
+-- Step 2: expire old snapshots — removes orphaned delete files from manifests and disk
+CALL local.system.expire_snapshots(
+  table       => 'local.db.gluten_test',
+  older_than  => now(),
+  retain_last => 1
+);
+
+-- Step 3: verify all delete files are gone
+SELECT content, count(*) FROM local.db.gluten_test.files GROUP BY content;
+-- expect: only content=0 remains
+```
+
+**Three-way distinction for delete file lifecycle:**
+
+| Delete file state | How to eliminate |
+|---|---|
+| Active, multiple per data file | `rewrite_position_delete_files` — compacts them into one |
+| Active, single per data file | `rewrite_data_files` — materialises the delete into the data file |
+| Orphaned (referenced data file removed from snapshot) | `expire_snapshots` — expires the snapshot that still lists them |
+
+### How `rewrite_position_delete_files` compacts delete files
+
+`rewrite_position_delete_files` operates **per data file**: it groups all position delete files by the data file they reference and merges multiple small delete files in each group into one larger file. It does **not** merge delete files across different data files.
+
+```
+Before rewrite:
+  data file 1 → delete file A (id=1, pos=0)  ┐
+  data file 1 → delete file B (id=3, pos=2)  ├─ same data file → compacted
+  data file 1 → delete file C (id=5, pos=4)  ┘
+
+  data file 2 → delete file D (id=6, pos=0)  ┐
+  data file 2 → delete file E (id=8, pos=2)  ├─ same data file → compacted
+                                              ┘
+After rewrite:
+  data file 1 → delete file A' (pos=0, pos=2, pos=4)   ← 3 merged into 1
+  data file 2 → delete file D' (pos=0, pos=2)           ← 2 merged into 1
+
+  Total: 5 delete files → 2 delete files
+```
+
+**Why merging helps read performance:**
+
+When Velox reads a data file with MoR applied, it must load **all** associated delete files into memory and merge them with the data. Fewer delete files per data file means fewer file opens and less merge overhead at read time.
+
+**Why the count stays the same after rewriting 1 delete file per data file:**
+
+```
+data file 1 → delete file A (1 file only)  →  rewrite (min-input-files=1)  →  delete file A' (1 file)
+data file 2 → delete file B (1 file only)  →  rewrite                       →  delete file B' (1 file)
+data file 3 → delete file C (1 file only)  →  rewrite                       →  delete file C' (1 file)
+
+Result: 3 delete files → 3 delete files  (count unchanged — nothing to merge)
+```
+
+The file count only decreases when a **group** (all delete files for one data file) has more than one member. With `min-input-files=1` each group is rewritten individually but produces exactly one output, so the total count is preserved.
+
+**`rewrite_position_delete_files` vs `rewrite_data_files`:**
+
+| | `rewrite_position_delete_files` | `rewrite_data_files` |
+|---|---|---|
+| Operates on | delete files | data files |
+| Goal | many delete files per data file → one | many data files → one (+ materialise all deletes) |
+| Data files changed | No | Yes (rewritten) |
+| Delete files after | Fewer (compacted), still exist | Gone (baked into new data files) |
+| Read cost improvement | Fewer file opens per MoR scan | Eliminates MoR merge entirely |
+| Best for | High-frequency streaming deletes (Flink CDC) accumulating many tiny delete files | Batch maintenance to reclaim full read performance |
+
+**When `rewrite_position_delete_files` has no work to do (returns `0 0 0 0`):**
+
+In a single Spark session with sequential `DELETE` statements, Iceberg's `RowDelta` commit automatically merges the new position delete entries with any existing delete file for the same data file at commit time. This means each data file accumulates at most one position delete file regardless of how many separate `DELETE` statements targeted it. `rewrite_position_delete_files` then finds nothing to compact. The procedure is most effective when multiple concurrent writers or streaming checkpoints each independently write their own delete files for the same data file without knowledge of each other.
+
+### Verified physical plan for `rewrite_position_delete_files` (2026-05-20)
+
+```
+AppendData (SparkPositionDeletesRewrite)              ← vanilla Spark write ❌
++- VeloxColumnarToRow
+   +- ^(3) SortExecTransformer [file_path, pos]       ← Velox native sort ✅
+      +- ^(3) ShuffledHashJoinExecTransformer          ← Velox native LeftSemi JOIN ✅
+         :    [file_path], [file_path], LeftSemi, BuildRight
+         :- ^(3) InputIteratorTransformer              (position_deletes side)
+         :  +- ColumnarExchange hashpartitioning(file_path)
+         :     +- ^(1) ProjectExecTransformer          ← Velox ✅
+         :        +- RowToVeloxColumnar ← ColumnarToRow ← format round-trip
+         :           +- BatchScan position_deletes     ← vanilla scan ❌ (metadata table)
+         +- ^(3) InputIteratorTransformer              (data_files side)
+            +- ColumnarExchange hashpartitioning(file_path)
+               +- ^(2) ProjectExecTransformer          ← Velox ✅
+                  +- RowToVeloxColumnar ← ColumnarToRow ← format round-trip
+                     +- BatchScan data_files           ← vanilla scan ❌ (metadata table)
+```
+
+**Node-by-node Gluten coverage:**
+
+| Node | Velox? | Reason |
+|---|---|---|
+| `BatchScan position_deletes` | ❌ | Metadata table (`.position_deletes`) — `IcebergScanTransformer` only handles regular data tables |
+| `BatchScan data_files` | ❌ | Metadata table (`.data_files`) — same reason |
+| `ProjectExecTransformer` | ✅ | Standard columnar project |
+| `ShuffledHashJoinExecTransformer` (LeftSemi) | ✅ | Velox native join |
+| `SortExecTransformer` | ✅ | Velox native sort by `(file_path, pos)` |
+| `AppendData (SparkPositionDeletesRewrite)` | ❌ | Special Iceberg position-delete write path; no Gluten equivalent |
+
+**Why `BatchScan` instead of `IcebergScanTransformer` here:**
+
+The inputs are Iceberg **metadata tables** (`.position_deletes`, `.data_files`), not regular data tables. `IcebergScanTransformer` is designed for regular Iceberg data scans only. Metadata tables go through a different scan path that Gluten does not currently offload.
+
+**What the LeftSemi JOIN does:**
+
+```sql
+position_deletes JOIN data_files ON file_path = file_path  (LeftSemi)
+```
+
+This filters out **orphaned** position delete entries — entries whose `file_path` no longer exists in the current snapshot's data files (e.g. entries pointing to files removed by a prior UPDATE). Only entries referencing live data files survive the join and are written to the new compacted delete files. This is how `rewrite_position_delete_files` implicitly cleans up stale entries without a separate purge step.
+
+### Source code proof: why read and write cannot use Velox native operators
+
+**Read side — `SparkStagedScan` is rejected by `IcebergScanTransformer`**
+
+`rewrite_position_delete_files` reads position delete files via `SparkRewritePositionDeleteRunner`, which passes a `SCAN_TASK_SET_ID` option to the Iceberg DataSource. This triggers `SparkStagedScan` instead of the normal `SparkBatchQueryScan`. `IcebergScanTransformer.supportsBatchScan` only accepts `SparkBatchQueryScan`:
+
+```scala
+// IcebergScanTransformer.scala:327
+def supportsBatchScan(scan: Scan): Boolean = {
+  scan.getClass == GlutenIcebergSourceUtil.getClassOfSparkBatchQueryScan
+  // classOf[SparkBatchQueryScan]
+  // SparkStagedScan ≠ SparkBatchQueryScan → false → falls back to BatchScan
+}
+```
+
+All utility methods in `GlutenIcebergSourceUtil` (`getReadPartitionSchema`, `getFileFormat`, `genSplitInfo`) also only handle `SparkBatchQueryScan` and throw `GlutenNotSupportException` for anything else.
+
+**Write side — `SparkPositionDeletesRewrite` is not a `SparkWrite`**
+
+Gluten's write offload gate in `IcebergWriteUtil.supportsWrite`:
+
+```scala
+// IcebergWriteUtil.scala:66
+def supportsWrite(write: Write): Boolean = {
+  write.isInstanceOf[SparkWrite]  // only SparkWrite subclasses are offloaded
+}
+```
+
+`SparkPositionDeletesRewrite` implements `Write` directly — it does **not** extend `SparkWrite`. Therefore `supportsWrite` returns `false`, and `OffloadIcebergAppend` (the rule that converts `AppendDataExec` → `VeloxIcebergAppendDataExec`) never fires:
+
+```scala
+// OffloadIcebergWrite.scala
+case class OffloadIcebergAppend() extends OffloadSingleNode {
+  override def offload(plan: SparkPlan): SparkPlan = plan match {
+    case a: AppendDataExec if supportsWrite(a.write) =>  // false for SparkPositionDeletesRewrite
+      VeloxIcebergAppendDataExec(a)
+    case other => other  // AppendDataExec passes through unchanged → vanilla Spark
+  }
+}
+```
+
+There is no special-case rule anywhere in `OffloadIcebergWrite.scala` or `VeloxIcebergWriteToDataSourceV2Exec.scala` for `SparkPositionDeletesRewrite`.
+
+**Complete code-level coverage table:**
+
+| Layer | Class | Gluten offloads? | Code-level reason |
+|---|---|---|---|
+| Scan | `SparkStagedScan` | ❌ | `supportsBatchScan` only accepts `SparkBatchQueryScan`; `SparkStagedScan` is a different class |
+| Write | `SparkPositionDeletesRewrite` | ❌ | `supportsWrite` checks `instanceof SparkWrite`; `SparkPositionDeletesRewrite` does not extend `SparkWrite` |
+| JOIN | `ShuffledHashJoinExecTransformer` | ✅ | Standard operator, normal Gluten offload |
+| Sort | `SortExecTransformer` | ✅ | Standard operator, normal Gluten offload |
+| Project | `ProjectExecTransformer` | ✅ | Standard operator, normal Gluten offload |
+
+**To support full Velox offload for `rewrite_position_delete_files`, two changes would be needed:**
+1. Add `SparkStagedScan` handling to `GlutenIcebergSourceUtil` and whitelist it in `IcebergScanTransformer.supportsBatchScan`
+2. Add a new Gluten offload rule for `AppendDataExec` backed by `SparkPositionDeletesRewrite`, implementing a native position-delete file writer in Velox
+
 ### Finding 2 — One file per row with default parallelism
 
 **Symptom:** Three `INSERT` batches of 5 rows each produce 15 data files total (5 files per batch, 1 row per file) instead of the expected 3 files (1 per batch).
@@ -1030,7 +1250,7 @@ In the query above, Stage 1 and `^(1)` happen to coincide — but they are indep
 | DELETE (MoR) | `VeloxIcebergReplaceDataExec` + `IcebergScanTransformer` | T-3 |
 | UPDATE (MoR) | `VeloxIcebergReplaceDataExec` + `IcebergScanTransformer` | T-4 |
 | MERGE (MoR) | `VeloxIcebergReplaceDataExec` + `IcebergScanTransformer` | T-5 |
-| rewrite_position_delete_files | `IcebergScanTransformer` + native write | T-6 |
+| rewrite_position_delete_files | `BatchScan` (metadata) + `SortExecTransformer` ✅ + `ShuffledHashJoinExecTransformer` ✅ | T-6 |
 | rewrite_data_files | `VeloxIcebergReplaceDataExec` | T-7 |
 | expire_snapshots | — (catalog-only) | T-8 |
 | Aggregation offload | `FlushableHashAggregateExecTransformer` | T-2 |
